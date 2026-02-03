@@ -17,9 +17,9 @@
 #define mmRPin 13
 
 #define limit_right 30
-#define limit_left 31
+#define limit_left 33
 
-float left_motor_trim = 0.95f;  // Mulai dari 1.0
+float left_motor_trim = 0.95f;
 float right_motor_trim = 1.0f;
 
 // ===== Section: SBUS =====
@@ -40,7 +40,7 @@ float percent[16];
 
 // ===== Section: Parameters =====
 int max_speed = 3000;
-int deadband_percent = 10;
+int deadband_percent = 5;
 
 unsigned long lastSignalTime = 0;
 const unsigned long SIGNAL_TIMEOUT = 150;
@@ -230,14 +230,48 @@ void decodeSBUS(uint8_t frame[]) {
 }
 
 float sbusToPercent(int value, int minPulse = 172, int midPulse = 992, int maxPulse = 1811) {
-  if (value == midPulse) return 0.0f;
-  if (value > midPulse) return ((float)(value - midPulse) / (maxPulse - midPulse)) * 100.0f;
-  return -((float)(midPulse - value) / (midPulse - minPulse)) * 100.0f;
+  float p;
+
+  if (value == midPulse) {
+    p = 0.0f;
+  } else if (value > midPulse) {
+    p = ((float)(value - midPulse) / (float)(maxPulse - midPulse)) * 100.0f;
+  } else {  // value < midPulse
+    p = -((float)(midPulse - value) / (float)(midPulse - minPulse)) * 100.0f;
+  }
+
+  return clampf(p, -100.0f, 100.0f);
 }
 
+
 void readAllChannels(float outputPercent[16]) {
-  for (int i = 0; i < 16; i++) outputPercent[i] = sbusToPercent(sbusChannels[i]);
+  for (int i = 0; i < 16; i++) {
+    outputPercent[i] = sbusToPercent(sbusChannels[i]);
+  }
+
+  // ===== DEBUG RC (rate-limited) =====
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint >= 200) {
+    lastPrint = millis();
+
+    Serial.print("RC[%] ");
+    for (int i = 0; i < 16; i++) {
+      Serial.print("CH");
+      Serial.print(i + 1);
+      Serial.print(":");
+      Serial.print(outputPercent[i], 1);
+      if (i < 15) Serial.print(" ");
+    }
+
+    Serial.print(" | FS:");
+    Serial.print(sbusFailsafe);
+    Serial.print(" LF:");
+    Serial.print(sbusFrameLost);
+    Serial.println();
+  }
 }
+
+
 
 // ===== Section: Local Rotary / Linear / Polisher =====
 void move_right(int speed) {
@@ -314,23 +348,28 @@ void drive_blv_from_rc() {
   }
   wasNeutral = false;
 
-  // === Movement Threshold ===
+  // === Movement Threshold (diperkecil dari 3.0 -> 1.5) ===
   static float last_throttle = 0;
   static float last_steer = 0;
-  const float MOVEMENT_THRESHOLD = 3.0f;  // 3% minimum Changing
+  const float MOVEMENT_THRESHOLD = 1.5f;
 
   if (fabs(throttle - last_throttle) < MOVEMENT_THRESHOLD && fabs(steer - last_steer) < MOVEMENT_THRESHOLD) {
-    return;  // (noise)
+    return;
   }
 
   last_throttle = throttle;
   last_steer = steer;
-  // === END TAMBAHAN ===
+  // === END ===
 
+  // === Spin-in-place: trim SEKARANG DITERAPKAN ===
   if (fabs(throttle) < TH_DB && fabs(steer) > ST_DB) {
     float spin = steer;
     float left = spin;
     float right = -spin;
+
+    // Terapkan trim pada spin juga
+    left = left * left_motor_trim;
+    right = right * right_motor_trim;
 
     left = clampf(left, -100.0f, 100.0f);
     right = clampf(right, -100.0f, 100.0f);
@@ -351,6 +390,7 @@ void drive_blv_from_rc() {
   float left = throttle - steer;
   float right = throttle + steer;
 
+  // Terapkan trim
   left = left * left_motor_trim;
   right = right * right_motor_trim;
 
@@ -391,6 +431,15 @@ void handleSerialCommands() {
       wasNeutral = false;
     }
   }
+}
+
+void emergencyChecker() {
+  static bool emergencyState = false;  // false=LOW, true=HIGH
+
+  if (percent[5] > 60.0f) emergencyState = true;
+  else if (percent[5] < 40.0f) emergencyState = false;
+
+  digitalWrite(emergency_pin, emergencyState ? LOW : HIGH);
 }
 
 // ===== Section: Main =====
@@ -451,15 +500,16 @@ void loop() {
     }
   }
 
-  digitalWrite(emergency_pin, HIGH);
-
   handleSerialCommands();
 
   if (millis() - lastSignalTime > SIGNAL_TIMEOUT || sbusFailsafe) {
     stop_all_outputs_safe();
+    digitalWrite(emergency_pin, LOW);  // set safe-state pilihanmu
     delay(50);
     return;
   }
+
+  emergencyChecker();
 
   if (monitorMode) {
     stop_all_outputs_safe();
