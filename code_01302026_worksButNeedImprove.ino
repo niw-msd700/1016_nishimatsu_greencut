@@ -52,21 +52,28 @@ const int32_t DEC_BRAKE = 10;
 
 bool wasNeutral = false;
 
-// =====================================================
-// ========= RC -> cmd_vel Mapping Parameters ===========
-// =====================================================
+float MAX_VX_MPS = 0.6f;
+float MAX_WZ_RPS = 2.0f;
+
 const bool RC_FORWARD_IS_NEGATIVE = false;
 const bool RC_RIGHT_IS_POSITIVE = true;
 const bool INVERT_STEER_WHEN_REVERSE = true;
 
-float MAX_VX_MPS = 0.6f;
-float MAX_WZ_RPS = 2.0f;
-
-// =====================================================
-// ========== Motor Direction Inversion (Output) =========
-// =====================================================
 const bool INVERT_LEFT_MOTOR = true;
 const bool INVERT_RIGHT_MOTOR = false;
+
+// =====================================================
+// =================== Mode Selection ===================
+// =====================================================
+static constexpr int MODE_CH_INDEX = 7;     // CH8 (0-based)
+static constexpr int SBUS_MID_PULSE = 992;  // matches sbusToPercent default
+
+// =====================================================
+// =================== Serial cmd_vel ===================
+// =====================================================
+CmdVel lastSerialCmd = { 0.0f, 0.0f, false };
+unsigned long lastSerialCmdMs = 0;
+const unsigned long SERIAL_CMD_TIMEOUT_MS = 300;
 
 // =====================================================
 // =================== SBUS (Library) ===================
@@ -99,6 +106,7 @@ static inline float clampf(float v, float lo, float hi) {
   if (v > hi) return hi;
   return v;
 }
+
 static inline float applyDeadband(float v, float db) {
   return (fabs(v) < db) ? 0.0f : v;
 }
@@ -122,12 +130,14 @@ static inline void rs485_tx() {
   digitalWrite(DE_RE_PIN, HIGH);
   delayMicroseconds(150);
 }
+
 static inline void rs485_rx() {
   MB_SERIAL.flush();
   delayMicroseconds(150);
   digitalWrite(DE_RE_PIN, LOW);
   delayMicroseconds(100);
 }
+
 static inline void put_i32_be(uint8_t *p, int32_t v) {
   p[0] = (uint8_t)((v >> 24) & 0xFF);
   p[1] = (uint8_t)((v >> 16) & 0xFF);
@@ -254,7 +264,6 @@ void readAllChannels(float outputPercent[16]) {
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint >= 200) {
     lastPrint = millis();
-
     Serial.print("RC[%] ");
     for (int i = 0; i < 16; i++) {
       Serial.print("CH");
@@ -272,7 +281,7 @@ void readAllChannels(float outputPercent[16]) {
 }
 
 // =====================================================
-// ===== Local Rotary / Linear / Polisher (unchanged) ====
+// ===== Local Rotary / Linear / Polisher Controllers ====
 // =====================================================
 int max_speed_rotary = 100;
 
@@ -281,22 +290,26 @@ void move_right(int speed) {
   digitalWrite(mRightREV, LOW);
   analogWrite(mmRPin, speed);
 }
+
 void move_left(int speed) {
   digitalWrite(mRightFWD, LOW);
   digitalWrite(mRightREV, HIGH);
   analogWrite(mmRPin, speed);
 }
+
 void stop_rotary() {
   digitalWrite(mRightFWD, LOW);
   digitalWrite(mRightREV, LOW);
   analogWrite(mmRPin, 0);
 }
+
 void rotary_controller() {
   int speed_rotary = abs(percent[0] / 100.0f * max_speed_rotary);
   if (percent[0] > 30) move_right(speed_rotary);
   else if (percent[0] < -30) move_left(speed_rotary);
   else stop_rotary();
 }
+
 void linear_actuator_controller() {
   if (percent[2] < -30) {
     digitalWrite(linact_fwd_pin, HIGH);
@@ -309,19 +322,23 @@ void linear_actuator_controller() {
     digitalWrite(linact_bwd_pin, LOW);
   }
 }
+
 void polish_start() {
   digitalWrite(polisher_S1, HIGH);
   digitalWrite(polisher_S2, HIGH);
 }
+
 void polish_stop() {
   digitalWrite(polisher_S1, LOW);
   digitalWrite(polisher_S2, LOW);
   delay(2);
 }
+
 void polisherControl() {
   if (percent[4] > 52) polish_start();
   else if (percent[4] < -50) polish_stop();
 }
+
 void emergencyChecker() {
   static bool emergencyState = false;
   if (percent[5] > 60.0f) emergencyState = true;
@@ -330,7 +347,7 @@ void emergencyChecker() {
 }
 
 // =====================================================
-// ===================== DRIVE CORE =====================
+// ===================== Drive Core =====================
 // =====================================================
 int32_t rpmFromPercent(float p) {
   if (fabs(p) < deadband_percent) return 0;
@@ -408,10 +425,46 @@ void drive_from_cmdvel(const CmdVel &cmd) {
 }
 
 // =====================================================
-// ======================= MAIN =========================
+// ================= Serial cmd_vel Parser ==============
+// =====================================================
+bool read_cmdvel_from_serial(CmdVel &out) {
+  while (Serial.available() > 0) {
+    int c = Serial.peek();
+    if (c != '@') {
+      Serial.read();
+      continue;
+    }
+
+    Serial.read();
+    while (Serial.available() == 0) return false;
+
+    char tag = (char)Serial.read();
+    if (tag != 'V' && tag != 'v') {
+      continue;
+    }
+
+    float vx = Serial.parseFloat();
+    float wz = Serial.parseFloat();
+
+    while (Serial.available() > 0) {
+      char x = (char)Serial.read();
+      if (x == '\n') break;
+    }
+
+    out.vx = vx;
+    out.wz = wz;
+    out.valid = true;
+    return true;
+  }
+  return false;
+}
+
+// =====================================================
+// ======================= Setup ========================
 // =====================================================
 void setup() {
   Serial.begin(115200);
+  Serial.setTimeout(15);
   delay(300);
 
   MB_SERIAL.begin(MB_BAUD, SERIAL_8E1);
@@ -453,6 +506,9 @@ void setup() {
   brake_blv_both_now();
 }
 
+// =====================================================
+// ======================== Loop ========================
+// =====================================================
 void loop() {
   if (sbus_rx.Read()) {
     sbus_data = sbus_rx.data();
@@ -463,16 +519,55 @@ void loop() {
   }
 
   emergencyChecker();
-
   linear_actuator_controller();
   rotary_controller();
   polisherControl();
 
   static unsigned long lastDrive = 0;
   const unsigned long DRIVE_PERIOD_MS = 40;
-  if (millis() - lastDrive >= DRIVE_PERIOD_MS) {
-    lastDrive = millis();
-    CmdVel cmd = rc_to_cmdvel();
-    drive_from_cmdvel(cmd);
+  if (millis() - lastDrive < DRIVE_PERIOD_MS) return;
+  lastDrive = millis();
+
+  bool rcMode = (sbusChannels[MODE_CH_INDEX] > SBUS_MID_PULSE);
+
+  CmdVel cmd = { 0.0f, 0.0f, true };
+
+  if (rcMode) {
+    cmd = rc_to_cmdvel();
+  } else {
+    CmdVel tmp;
+    if (read_cmdvel_from_serial(tmp)) {
+      lastSerialCmd = tmp;
+      lastSerialCmdMs = millis();
+
+      Serial.print("CMD ");
+      Serial.print(tmp.vx, 3);
+      Serial.print(" ");
+      Serial.println(tmp.wz, 3);
+    }
+
+    if ((millis() - lastSerialCmdMs) <= SERIAL_CMD_TIMEOUT_MS && lastSerialCmd.valid) {
+      cmd = lastSerialCmd;
+      cmd.valid = true;
+    } else {
+      cmd.vx = 0.0f;
+      cmd.wz = 0.0f;
+      cmd.valid = true;
+    }
   }
+
+  static unsigned long lastModePrint = 0;
+  if (millis() - lastModePrint >= 250) {
+    lastModePrint = millis();
+    Serial.print("MODE:");
+    Serial.print(rcMode ? "RC" : "SER");
+    Serial.print(" CH8raw:");
+    Serial.print(sbusChannels[MODE_CH_INDEX]);
+    Serial.print(" lastV:");
+    Serial.print(lastSerialCmd.vx, 3);
+    Serial.print(" lastW:");
+    Serial.println(lastSerialCmd.wz, 3);
+  }
+
+  drive_from_cmdvel(cmd);
 }
