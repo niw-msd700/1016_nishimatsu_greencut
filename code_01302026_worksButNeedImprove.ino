@@ -2,6 +2,7 @@
 #include <math.h>
 #include <string.h>
 #include "sbus.h"
+#include <stdlib.h>
 
 // =====================================================
 // =================== CMD_VEL STRUCT ===================
@@ -62,14 +63,19 @@ const bool INVERT_STEER_WHEN_REVERSE = true;
 const bool INVERT_LEFT_MOTOR = true;
 const bool INVERT_RIGHT_MOTOR = false;
 
+const bool INVERT_WZ_WHEN_SPIN_ONLY = true;
+
+const bool SERIAL_VX_INVERT = true;
+const bool SERIAL_WZ_INVERT = true;
+
 // =====================================================
 // =================== Mode Selection ===================
 // =====================================================
-static constexpr int MODE_CH_INDEX = 7;     // CH8 (0-based)
-static constexpr int SBUS_MID_PULSE = 992;  // matches sbusToPercent default
+static constexpr int MODE_CH_INDEX = 7;
+static constexpr int SBUS_MID_PULSE = 992;
 
 // =====================================================
-// =================== Serial cmd_vel ===================
+// =================== Serial Twist =====================
 // =====================================================
 CmdVel lastSerialCmd = { 0.0f, 0.0f, false };
 unsigned long lastSerialCmdMs = 0;
@@ -109,6 +115,12 @@ static inline float clampf(float v, float lo, float hi) {
 
 static inline float applyDeadband(float v, float db) {
   return (fabs(v) < db) ? 0.0f : v;
+}
+
+static inline float clampAbs(float v, float maxAbs) {
+  if (v > maxAbs) return maxAbs;
+  if (v < -maxAbs) return -maxAbs;
+  return v;
 }
 
 // =====================================================
@@ -374,11 +386,23 @@ CmdVel rc_to_cmdvel() {
     cmd.wz = -cmd.wz;
   }
 
+  if (INVERT_WZ_WHEN_SPIN_ONLY) {
+    bool spinOnly = (th_cmd == 0.0f && st_cmd != 0.0f);
+    if (spinOnly) {
+      cmd.wz = -cmd.wz;
+    }
+  }
+
   return cmd;
 }
 
-void drive_from_cmdvel(const CmdVel &cmd) {
-  if (!cmd.valid) return;
+
+void drive_from_cmdvel(const CmdVel &cmdIn) {
+  if (!cmdIn.valid) return;
+
+  CmdVel cmd = cmdIn;
+  cmd.vx = clampAbs(cmd.vx, MAX_VX_MPS);
+  cmd.wz = clampAbs(cmd.wz, MAX_WZ_RPS);
 
   float th_cmd = 0.0f;
   float st_cmd = 0.0f;
@@ -425,46 +449,75 @@ void drive_from_cmdvel(const CmdVel &cmd) {
 }
 
 // =====================================================
-// ================= Serial cmd_vel Parser ==============
+// ================== Serial Twist Parser ===============
 // =====================================================
-bool read_cmdvel_from_serial(CmdVel &out) {
+bool read_twist_from_serial(CmdVel &out) {
+  static char line[96];
+  static uint8_t idx = 0;
+
   while (Serial.available() > 0) {
-    int c = Serial.peek();
-    if (c != '@') {
-      Serial.read();
+    char c = (char)Serial.read();
+
+    if (c == '\r' || c == '\n') {
+      if (idx == 0) continue;
+      line[idx] = '\0';
+      idx = 0;
+
+      if (line[0] == '@' && (line[1] == 'T' || line[1] == 't')) {
+        char *p = line + 2;
+
+        while (*p == ' ' || *p == '\t') p++;
+
+        char *end1 = nullptr;
+        double vx = strtod(p, &end1);
+        if (end1 == p) {
+          Serial.print("BAD ");
+          Serial.println(line);
+          continue;
+        }
+
+        p = end1;
+        while (*p == ' ' || *p == '\t') p++;
+
+        char *end2 = nullptr;
+        double wz = strtod(p, &end2);
+        if (end2 == p) {
+          Serial.print("BAD ");
+          Serial.println(line);
+          continue;
+        }
+
+        out.vx = (float)vx;
+        out.wz = (float)wz;
+        out.valid = true;
+
+        Serial.print("ACK ");
+        Serial.print(out.vx, 3);
+        Serial.print(" ");
+        Serial.println(out.wz, 3);
+
+        return true;
+      }
+
       continue;
     }
 
-    Serial.read();
-    while (Serial.available() == 0) return false;
-
-    char tag = (char)Serial.read();
-    if (tag != 'V' && tag != 'v') {
-      continue;
+    if (idx < sizeof(line) - 1) {
+      line[idx++] = c;
+    } else {
+      idx = 0;
     }
-
-    float vx = Serial.parseFloat();
-    float wz = Serial.parseFloat();
-
-    while (Serial.available() > 0) {
-      char x = (char)Serial.read();
-      if (x == '\n') break;
-    }
-
-    out.vx = vx;
-    out.wz = wz;
-    out.valid = true;
-    return true;
   }
+
   return false;
 }
+
 
 // =====================================================
 // ======================= Setup ========================
 // =====================================================
 void setup() {
   Serial.begin(115200);
-  Serial.setTimeout(15);
   delay(300);
 
   MB_SERIAL.begin(MB_BAUD, SERIAL_8E1);
@@ -536,7 +589,7 @@ void loop() {
     cmd = rc_to_cmdvel();
   } else {
     CmdVel tmp;
-    if (read_cmdvel_from_serial(tmp)) {
+    if (read_twist_from_serial(tmp)) {
       lastSerialCmd = tmp;
       lastSerialCmdMs = millis();
 
@@ -546,7 +599,8 @@ void loop() {
       Serial.println(tmp.wz, 3);
     }
 
-    if ((millis() - lastSerialCmdMs) <= SERIAL_CMD_TIMEOUT_MS && lastSerialCmd.valid) {
+    bool fresh = (millis() - lastSerialCmdMs) <= SERIAL_CMD_TIMEOUT_MS;
+    if (fresh && lastSerialCmd.valid) {
       cmd = lastSerialCmd;
       cmd.valid = true;
     } else {
@@ -554,6 +608,9 @@ void loop() {
       cmd.wz = 0.0f;
       cmd.valid = true;
     }
+
+    if (SERIAL_VX_INVERT) cmd.vx = -cmd.vx;
+    if (SERIAL_WZ_INVERT) cmd.wz = -cmd.wz;
   }
 
   static unsigned long lastModePrint = 0;
