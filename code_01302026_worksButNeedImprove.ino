@@ -16,8 +16,8 @@ struct CmdVel {
 struct AuxCmd {
   float rotary;    // -100..100
   float lin;       // -100..100
-  float polisher;  // -100..100 (use thresholds like RC)
-  float emergency; // -100..100 (use hysteresis like RC)
+  float polisher;  // -100..100
+  float emergency; // -100..100
   bool valid;
 };
 
@@ -85,13 +85,19 @@ static constexpr int SBUS_MID_PULSE = 992;
 // =====================================================
 // =================== Serial State =====================
 // =====================================================
+// One serial-link indicator:
+unsigned long lastSerialRxMs = 0;
+bool serialRxSeen = false;
+const unsigned long SERIAL_LINK_TIMEOUT_MS = 300;
+
+// Per-message freshness (not a separate "link indicator"):
 CmdVel lastSerialCmd = {0.0f, 0.0f, false};
 unsigned long lastSerialCmdMs = 0;
-const unsigned long SERIAL_CMD_TIMEOUT_MS = 300;
+const unsigned long SERIAL_TWIST_TIMEOUT_MS = 300;
 
-AuxCmd lastAuxCmd = {0.0f, 0.0f, -100.0f, -100.0f, false}; // default polisher OFF, emergency OFF-input
+AuxCmd lastAuxCmd = {0.0f, 0.0f, -100.0f, -100.0f, false}; // default polisher OFF, emergency released
 unsigned long lastAuxCmdMs = 0;
-const unsigned long AUX_CMD_TIMEOUT_MS = 300;
+const unsigned long AUX_VALUES_TIMEOUT_MS = 300;
 
 // =====================================================
 // =================== SBUS (Library) ===================
@@ -100,10 +106,10 @@ static constexpr bool SBUS_INVERTED = false;
 bfs::SbusRx sbus_rx(&Serial1, SBUS_INVERTED);
 bfs::SbusData sbus_data;
 
-int sbusChannels[16];
+int sbusChannels[16] = {0};
 bool sbusFrameLost = false;
 bool sbusFailsafe = false;
-float percent[16];
+float percent[16] = {0};
 
 // =====================================================
 // ================= BLV Modbus (TX-only) ===============
@@ -283,24 +289,6 @@ float sbusToPercent(int value, int minPulse = 172, int midPulse = 992, int maxPu
 
 void readAllChannels(float outputPercent[16]) {
   for (int i = 0; i < 16; i++) outputPercent[i] = sbusToPercent(sbusChannels[i]);
-
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint >= 200) {
-    lastPrint = millis();
-    Serial.print("RC[%] ");
-    for (int i = 0; i < 16; i++) {
-      Serial.print("CH");
-      Serial.print(i + 1);
-      Serial.print(":");
-      Serial.print(outputPercent[i], 1);
-      if (i < 15) Serial.print(" ");
-    }
-    Serial.print(" | FS:");
-    Serial.print(sbusFailsafe);
-    Serial.print(" LF:");
-    Serial.print(sbusFrameLost);
-    Serial.println();
-  }
 }
 
 // =====================================================
@@ -360,7 +348,6 @@ void polish_stop() {
 void polisher_from_percent(float p) {
   if (p > 52) polish_start();
   else if (p < -50) polish_stop();
-  // else: keep state (hysteresis-like behavior)
 }
 
 void emergency_from_percent(float p) {
@@ -370,13 +357,8 @@ void emergency_from_percent(float p) {
   digitalWrite(emergency_pin, emergencyState ? LOW : HIGH); // active LOW
 }
 
-// RC wrappers (same behavior you had)
-void polisherControlRC() { polisher_from_percent(percent[4]); }   // CH5
-void emergencyCheckerRC() { emergency_from_percent(percent[5]); } // CH6
-
-// Serial safe fallback
 void emergency_force_active() {
-  digitalWrite(emergency_pin, LOW); // active LOW (force emergency)
+  digitalWrite(emergency_pin, LOW); // active LOW
 }
 
 // =====================================================
@@ -494,35 +476,28 @@ bool read_commands_from_serial(CmdVel &tw, bool &gotTw, AuxCmd &aux, bool &gotAu
       char *p = line + 2;
       while (*p == ' ' || *p == '\t') p++;
 
-      // @T vx wz
       if (cmd == 'T' || cmd == 't') {
         char *end1 = nullptr;
         double vx = strtod(p, &end1);
-        if (end1 == p) { Serial.print("BAD "); Serial.println(line); continue; }
+        if (end1 == p) continue;
 
         p = end1;
         while (*p == ' ' || *p == '\t') p++;
 
         char *end2 = nullptr;
         double wz = strtod(p, &end2);
-        if (end2 == p) { Serial.print("BAD "); Serial.println(line); continue; }
+        if (end2 == p) continue;
 
         tw.vx = (float)vx;
         tw.wz = (float)wz;
         tw.valid = true;
         gotTw = true;
-
-        Serial.print("ACK T ");
-        Serial.print(tw.vx, 3);
-        Serial.print(" ");
-        Serial.println(tw.wz, 3);
         continue;
       }
 
-      // Single number for R/L/P/E
       char *endv = nullptr;
       double v = strtod(p, &endv);
-      if (endv == p) { Serial.print("BAD "); Serial.println(line); continue; }
+      if (endv == p) continue;
 
       float pv = clampf((float)v, -100.0f, 100.0f);
 
@@ -530,8 +505,6 @@ bool read_commands_from_serial(CmdVel &tw, bool &gotTw, AuxCmd &aux, bool &gotAu
         aux.rotary = pv;
         aux.valid = true;
         gotAux = true;
-        Serial.print("ACK R ");
-        Serial.println(aux.rotary, 1);
         continue;
       }
 
@@ -539,8 +512,6 @@ bool read_commands_from_serial(CmdVel &tw, bool &gotTw, AuxCmd &aux, bool &gotAu
         aux.lin = pv;
         aux.valid = true;
         gotAux = true;
-        Serial.print("ACK L ");
-        Serial.println(aux.lin, 1);
         continue;
       }
 
@@ -548,8 +519,6 @@ bool read_commands_from_serial(CmdVel &tw, bool &gotTw, AuxCmd &aux, bool &gotAu
         aux.polisher = pv;
         aux.valid = true;
         gotAux = true;
-        Serial.print("ACK P ");
-        Serial.println(aux.polisher, 1);
         continue;
       }
 
@@ -557,8 +526,6 @@ bool read_commands_from_serial(CmdVel &tw, bool &gotTw, AuxCmd &aux, bool &gotAu
         aux.emergency = pv;
         aux.valid = true;
         gotAux = true;
-        Serial.print("ACK E ");
-        Serial.println(aux.emergency, 1);
         continue;
       }
 
@@ -609,7 +576,10 @@ void setup() {
   digitalWrite(linact_fwd_pin, LOW);
   digitalWrite(linact_bwd_pin, LOW);
   polish_stop();
-  digitalWrite(emergency_pin, HIGH); // emergency inactive (active LOW)
+
+  // Default emergency released (inactive). If serial link is not alive,
+  // loop() will force it active.
+  digitalWrite(emergency_pin, HIGH); // inactive (active LOW)
 
   set_son(SLAVE_1, true);
   delay(200);
@@ -646,20 +616,21 @@ void loop() {
     AuxCmd auxTmp = lastAuxCmd; // keep last values when only one field updated
 
     bool gotTw = false, gotAux = false;
-    read_commands_from_serial(twTmp, gotTw, auxTmp, gotAux);
+    bool gotAny = read_commands_from_serial(twTmp, gotTw, auxTmp, gotAux);
 
     if (gotTw) {
       lastSerialCmd = twTmp;
       lastSerialCmdMs = millis();
-      Serial.print("CMD ");
-      Serial.print(twTmp.vx, 3);
-      Serial.print(" ");
-      Serial.println(twTmp.wz, 3);
     }
 
     if (gotAux) {
       lastAuxCmd = auxTmp;
       lastAuxCmdMs = millis();
+    }
+
+    if (gotAny) {
+      serialRxSeen = true;
+      lastSerialRxMs = millis();
     }
   }
 
@@ -668,55 +639,57 @@ void loop() {
 
   if (rcMode) {
     cmd = rc_to_cmdvel();
+
+    // AUX (RC)
+    rotary_from_percent(percent[0]);      // CH1
+    linear_from_percent(percent[2]);      // CH3
+    polisher_from_percent(percent[4]);    // CH5
+    emergency_from_percent(percent[5]);   // CH6
+
   } else {
-    bool fresh = (millis() - lastSerialCmdMs) <= SERIAL_CMD_TIMEOUT_MS;
-    if (fresh && lastSerialCmd.valid) {
-      cmd = lastSerialCmd;
-      cmd.valid = true;
-    } else {
+    // One serial-link indicator:
+    bool serialOk = serialRxSeen && ((millis() - lastSerialRxMs) <= SERIAL_LINK_TIMEOUT_MS);
+
+    if (!serialOk) {
+      // Total serial loss -> full safe
       cmd.vx = 0.0f;
       cmd.wz = 0.0f;
       cmd.valid = true;
-    }
 
-    if (SERIAL_VX_INVERT) cmd.vx = -cmd.vx;
-    if (SERIAL_WZ_INVERT) cmd.wz = -cmd.wz;
-  }
-
-  // --- Apply AUX (RC or Serial) ---
-  if (rcMode) {
-    rotary_from_percent(percent[0]);      // CH1
-    linear_from_percent(percent[2]);      // CH3
-    polisherControlRC();                  // CH5
-    emergencyCheckerRC();                 // CH6
-  } else {
-    bool auxFresh = (millis() - lastAuxCmdMs) <= AUX_CMD_TIMEOUT_MS;
-
-    if (!auxFresh || !lastAuxCmd.valid) {
       rotary_from_percent(0.0f);
       linear_from_percent(0.0f);
       polish_stop();
-      emergency_force_active();           // safety default
+      emergency_force_active();
+
     } else {
-      rotary_from_percent(lastAuxCmd.rotary);
-      linear_from_percent(lastAuxCmd.lin);
-      polisher_from_percent(lastAuxCmd.polisher);
+      // Drive uses twist if fresh; otherwise stop drive (but link still OK)
+      bool twFresh = lastSerialCmd.valid && ((millis() - lastSerialCmdMs) <= SERIAL_TWIST_TIMEOUT_MS);
+
+      if (twFresh) {
+        cmd = lastSerialCmd;
+        cmd.valid = true;
+      } else {
+        cmd.vx = 0.0f;
+        cmd.wz = 0.0f;
+        cmd.valid = true;
+      }
+
+      if (SERIAL_VX_INVERT) cmd.vx = -cmd.vx;
+      if (SERIAL_WZ_INVERT) cmd.wz = -cmd.wz;
+
+      // AUX: if values stale, neutralize rotary/linear and stop polisher.
+      bool auxFresh = lastAuxCmd.valid && ((millis() - lastAuxCmdMs) <= AUX_VALUES_TIMEOUT_MS);
+
+      rotary_from_percent(auxFresh ? lastAuxCmd.rotary : 0.0f);
+      linear_from_percent(auxFresh ? lastAuxCmd.lin    : 0.0f);
+
+      if (auxFresh) polisher_from_percent(lastAuxCmd.polisher);
+      else          polish_stop();
+
+      // Emergency follows last commanded value whenever serial link is OK.
+      // Default value is -100 (released) until a command arrives.
       emergency_from_percent(lastAuxCmd.emergency);
     }
-  }
-
-  // --- Debug mode print ---
-  static unsigned long lastModePrint = 0;
-  if (millis() - lastModePrint >= 250) {
-    lastModePrint = millis();
-    Serial.print("MODE:");
-    Serial.print(rcMode ? "RC" : "SER");
-    Serial.print(" CH8raw:");
-    Serial.print(sbusChannels[MODE_CH_INDEX]);
-    Serial.print(" lastV:");
-    Serial.print(lastSerialCmd.vx, 3);
-    Serial.print(" lastW:");
-    Serial.println(lastSerialCmd.wz, 3);
   }
 
   // --- Drive output ---
