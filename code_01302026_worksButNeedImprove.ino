@@ -5,11 +5,19 @@
 #include <stdlib.h>
 
 // =====================================================
-// =================== CMD_VEL STRUCT ===================
+// =================== MESSAGE STRUCT ===================
 // =====================================================
 struct CmdVel {
   float vx;
   float wz;
+  bool valid;
+};
+
+struct AuxCmd {
+  float rotary;    // -100..100
+  float lin;       // -100..100
+  float polisher;  // -100..100 (use thresholds like RC)
+  float emergency; // -100..100 (use hysteresis like RC)
   bool valid;
 };
 
@@ -71,15 +79,19 @@ const bool SERIAL_WZ_INVERT = true;
 // =====================================================
 // =================== Mode Selection ===================
 // =====================================================
-static constexpr int MODE_CH_INDEX = 7;
+static constexpr int MODE_CH_INDEX = 7;   // CH8 (0-based)
 static constexpr int SBUS_MID_PULSE = 992;
 
 // =====================================================
-// =================== Serial Twist =====================
+// =================== Serial State =====================
 // =====================================================
-CmdVel lastSerialCmd = { 0.0f, 0.0f, false };
+CmdVel lastSerialCmd = {0.0f, 0.0f, false};
 unsigned long lastSerialCmdMs = 0;
 const unsigned long SERIAL_CMD_TIMEOUT_MS = 300;
+
+AuxCmd lastAuxCmd = {0.0f, 0.0f, -100.0f, -100.0f, false}; // default polisher OFF, emergency OFF-input
+unsigned long lastAuxCmdMs = 0;
+const unsigned long AUX_CMD_TIMEOUT_MS = 300;
 
 // =====================================================
 // =================== SBUS (Library) ===================
@@ -167,7 +179,6 @@ void modbus_send(const uint8_t *pdu, int lenNoCrc) {
   buf[lenNoCrc + 1] = (crc >> 8) & 0xFF;
 
   delayMicroseconds(400);
-
   while (MB_SERIAL.available()) MB_SERIAL.read();
 
   rs485_tx();
@@ -293,19 +304,19 @@ void readAllChannels(float outputPercent[16]) {
 }
 
 // =====================================================
-// ===== Local Rotary / Linear / Polisher Controllers ====
+// ===== Local Rotary / Linear / Polisher / Emergency ====
 // =====================================================
 int max_speed_rotary = 100;
 
 void move_right(int speed) {
-  digitalWrite(mRightFWD, HIGH);
-  digitalWrite(mRightREV, LOW);
+  digitalWrite(mRightFWD, LOW);
+  digitalWrite(mRightREV, HIGH);
   analogWrite(mmRPin, speed);
 }
 
 void move_left(int speed) {
-  digitalWrite(mRightFWD, LOW);
-  digitalWrite(mRightREV, HIGH);
+  digitalWrite(mRightFWD, HIGH);
+  digitalWrite(mRightREV, LOW);
   analogWrite(mmRPin, speed);
 }
 
@@ -315,18 +326,18 @@ void stop_rotary() {
   analogWrite(mmRPin, 0);
 }
 
-void rotary_controller() {
-  int speed_rotary = abs(percent[0] / 100.0f * max_speed_rotary);
-  if (percent[0] > 30) move_right(speed_rotary);
-  else if (percent[0] < -30) move_left(speed_rotary);
+void rotary_from_percent(float p) {
+  int speed_rotary = abs(p / 100.0f * max_speed_rotary);
+  if (p > 30) move_right(speed_rotary);
+  else if (p < -30) move_left(speed_rotary);
   else stop_rotary();
 }
 
-void linear_actuator_controller() {
-  if (percent[2] < -30) {
+void linear_from_percent(float p) {
+  if (p < -30) {
     digitalWrite(linact_fwd_pin, HIGH);
     digitalWrite(linact_bwd_pin, LOW);
-  } else if (percent[2] > 30) {
+  } else if (p > 30) {
     digitalWrite(linact_bwd_pin, HIGH);
     digitalWrite(linact_fwd_pin, LOW);
   } else {
@@ -346,16 +357,26 @@ void polish_stop() {
   delay(2);
 }
 
-void polisherControl() {
-  if (percent[4] > 52) polish_start();
-  else if (percent[4] < -50) polish_stop();
+void polisher_from_percent(float p) {
+  if (p > 52) polish_start();
+  else if (p < -50) polish_stop();
+  // else: keep state (hysteresis-like behavior)
 }
 
-void emergencyChecker() {
+void emergency_from_percent(float p) {
   static bool emergencyState = false;
-  if (percent[5] > 60.0f) emergencyState = true;
-  else if (percent[5] < 40.0f) emergencyState = false;
-  digitalWrite(emergency_pin, emergencyState ? LOW : HIGH);
+  if (p > 60.0f) emergencyState = true;
+  else if (p < 40.0f) emergencyState = false;
+  digitalWrite(emergency_pin, emergencyState ? LOW : HIGH); // active LOW
+}
+
+// RC wrappers (same behavior you had)
+void polisherControlRC() { polisher_from_percent(percent[4]); }   // CH5
+void emergencyCheckerRC() { emergency_from_percent(percent[5]); } // CH6
+
+// Serial safe fallback
+void emergency_force_active() {
+  digitalWrite(emergency_pin, LOW); // active LOW (force emergency)
 }
 
 // =====================================================
@@ -368,8 +389,8 @@ int32_t rpmFromPercent(float p) {
 }
 
 CmdVel rc_to_cmdvel() {
-  float th_cmd = percent[1];
-  float st_cmd = percent[3];
+  float th_cmd = percent[1]; // CH2
+  float st_cmd = percent[3]; // CH4
 
   if (RC_FORWARD_IS_NEGATIVE) th_cmd = -th_cmd;
   if (RC_RIGHT_IS_POSITIVE) st_cmd = -st_cmd;
@@ -382,20 +403,15 @@ CmdVel rc_to_cmdvel() {
   cmd.wz = (st_cmd / 100.0f) * MAX_WZ_RPS;
   cmd.valid = true;
 
-  if (INVERT_STEER_WHEN_REVERSE && cmd.vx < 0.0f) {
-    cmd.wz = -cmd.wz;
-  }
+  if (INVERT_STEER_WHEN_REVERSE && cmd.vx < 0.0f) cmd.wz = -cmd.wz;
 
   if (INVERT_WZ_WHEN_SPIN_ONLY) {
     bool spinOnly = (th_cmd == 0.0f && st_cmd != 0.0f);
-    if (spinOnly) {
-      cmd.wz = -cmd.wz;
-    }
+    if (spinOnly) cmd.wz = -cmd.wz;
   }
 
   return cmd;
 }
-
 
 void drive_from_cmdvel(const CmdVel &cmdIn) {
   if (!cmdIn.valid) return;
@@ -449,11 +465,20 @@ void drive_from_cmdvel(const CmdVel &cmdIn) {
 }
 
 // =====================================================
-// ================== Serial Twist Parser ===============
+// ================== Unified Serial Parser =============
 // =====================================================
-bool read_twist_from_serial(CmdVel &out) {
+// Commands:
+//   @T vx wz
+//   @R percent
+//   @L percent
+//   @P percent
+//   @E percent
+bool read_commands_from_serial(CmdVel &tw, bool &gotTw, AuxCmd &aux, bool &gotAux) {
   static char line[96];
   static uint8_t idx = 0;
+
+  gotTw = false;
+  gotAux = false;
 
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
@@ -463,55 +488,89 @@ bool read_twist_from_serial(CmdVel &out) {
       line[idx] = '\0';
       idx = 0;
 
-      if (line[0] == '@' && (line[1] == 'T' || line[1] == 't')) {
-        char *p = line + 2;
+      if (line[0] != '@') continue;
 
-        while (*p == ' ' || *p == '\t') p++;
+      char cmd = line[1];
+      char *p = line + 2;
+      while (*p == ' ' || *p == '\t') p++;
 
+      // @T vx wz
+      if (cmd == 'T' || cmd == 't') {
         char *end1 = nullptr;
         double vx = strtod(p, &end1);
-        if (end1 == p) {
-          Serial.print("BAD ");
-          Serial.println(line);
-          continue;
-        }
+        if (end1 == p) { Serial.print("BAD "); Serial.println(line); continue; }
 
         p = end1;
         while (*p == ' ' || *p == '\t') p++;
 
         char *end2 = nullptr;
         double wz = strtod(p, &end2);
-        if (end2 == p) {
-          Serial.print("BAD ");
-          Serial.println(line);
-          continue;
-        }
+        if (end2 == p) { Serial.print("BAD "); Serial.println(line); continue; }
 
-        out.vx = (float)vx;
-        out.wz = (float)wz;
-        out.valid = true;
+        tw.vx = (float)vx;
+        tw.wz = (float)wz;
+        tw.valid = true;
+        gotTw = true;
 
-        Serial.print("ACK ");
-        Serial.print(out.vx, 3);
+        Serial.print("ACK T ");
+        Serial.print(tw.vx, 3);
         Serial.print(" ");
-        Serial.println(out.wz, 3);
+        Serial.println(tw.wz, 3);
+        continue;
+      }
 
-        return true;
+      // Single number for R/L/P/E
+      char *endv = nullptr;
+      double v = strtod(p, &endv);
+      if (endv == p) { Serial.print("BAD "); Serial.println(line); continue; }
+
+      float pv = clampf((float)v, -100.0f, 100.0f);
+
+      if (cmd == 'R' || cmd == 'r') {
+        aux.rotary = pv;
+        aux.valid = true;
+        gotAux = true;
+        Serial.print("ACK R ");
+        Serial.println(aux.rotary, 1);
+        continue;
+      }
+
+      if (cmd == 'L' || cmd == 'l') {
+        aux.lin = pv;
+        aux.valid = true;
+        gotAux = true;
+        Serial.print("ACK L ");
+        Serial.println(aux.lin, 1);
+        continue;
+      }
+
+      if (cmd == 'P' || cmd == 'p') {
+        aux.polisher = pv;
+        aux.valid = true;
+        gotAux = true;
+        Serial.print("ACK P ");
+        Serial.println(aux.polisher, 1);
+        continue;
+      }
+
+      if (cmd == 'E' || cmd == 'e') {
+        aux.emergency = pv;
+        aux.valid = true;
+        gotAux = true;
+        Serial.print("ACK E ");
+        Serial.println(aux.emergency, 1);
+        continue;
       }
 
       continue;
     }
 
-    if (idx < sizeof(line) - 1) {
-      line[idx++] = c;
-    } else {
-      idx = 0;
-    }
+    if (idx < sizeof(line) - 1) line[idx++] = c;
+    else idx = 0;
   }
 
-  return false;
+  return gotTw || gotAux;
 }
-
 
 // =====================================================
 // ======================= Setup ========================
@@ -550,6 +609,7 @@ void setup() {
   digitalWrite(linact_fwd_pin, LOW);
   digitalWrite(linact_bwd_pin, LOW);
   polish_stop();
+  digitalWrite(emergency_pin, HIGH); // emergency inactive (active LOW)
 
   set_son(SLAVE_1, true);
   delay(200);
@@ -563,6 +623,7 @@ void setup() {
 // ======================== Loop ========================
 // =====================================================
 void loop() {
+  // --- Read SBUS ---
   if (sbus_rx.Read()) {
     sbus_data = sbus_rx.data();
     for (int i = 0; i < 16; i++) sbusChannels[i] = sbus_data.ch[i];
@@ -571,34 +632,43 @@ void loop() {
     readAllChannels(percent);
   }
 
-  emergencyChecker();
-  linear_actuator_controller();
-  rotary_controller();
-  polisherControl();
-
-  static unsigned long lastDrive = 0;
-  const unsigned long DRIVE_PERIOD_MS = 40;
-  if (millis() - lastDrive < DRIVE_PERIOD_MS) return;
-  lastDrive = millis();
+  // --- 25Hz update gate (drive + aux) ---
+  static unsigned long lastTick = 0;
+  const unsigned long PERIOD_MS = 40;
+  if (millis() - lastTick < PERIOD_MS) return;
+  lastTick = millis();
 
   bool rcMode = (sbusChannels[MODE_CH_INDEX] > SBUS_MID_PULSE);
 
-  CmdVel cmd = { 0.0f, 0.0f, true };
+  // --- Serial mode: parse unified commands ---
+  if (!rcMode) {
+    CmdVel twTmp;
+    AuxCmd auxTmp = lastAuxCmd; // keep last values when only one field updated
+
+    bool gotTw = false, gotAux = false;
+    read_commands_from_serial(twTmp, gotTw, auxTmp, gotAux);
+
+    if (gotTw) {
+      lastSerialCmd = twTmp;
+      lastSerialCmdMs = millis();
+      Serial.print("CMD ");
+      Serial.print(twTmp.vx, 3);
+      Serial.print(" ");
+      Serial.println(twTmp.wz, 3);
+    }
+
+    if (gotAux) {
+      lastAuxCmd = auxTmp;
+      lastAuxCmdMs = millis();
+    }
+  }
+
+  // --- Build drive cmd (RC or Serial) ---
+  CmdVel cmd = {0.0f, 0.0f, true};
 
   if (rcMode) {
     cmd = rc_to_cmdvel();
   } else {
-    CmdVel tmp;
-    if (read_twist_from_serial(tmp)) {
-      lastSerialCmd = tmp;
-      lastSerialCmdMs = millis();
-
-      Serial.print("CMD ");
-      Serial.print(tmp.vx, 3);
-      Serial.print(" ");
-      Serial.println(tmp.wz, 3);
-    }
-
     bool fresh = (millis() - lastSerialCmdMs) <= SERIAL_CMD_TIMEOUT_MS;
     if (fresh && lastSerialCmd.valid) {
       cmd = lastSerialCmd;
@@ -613,6 +683,29 @@ void loop() {
     if (SERIAL_WZ_INVERT) cmd.wz = -cmd.wz;
   }
 
+  // --- Apply AUX (RC or Serial) ---
+  if (rcMode) {
+    rotary_from_percent(percent[0]);      // CH1
+    linear_from_percent(percent[2]);      // CH3
+    polisherControlRC();                  // CH5
+    emergencyCheckerRC();                 // CH6
+  } else {
+    bool auxFresh = (millis() - lastAuxCmdMs) <= AUX_CMD_TIMEOUT_MS;
+
+    if (!auxFresh || !lastAuxCmd.valid) {
+      rotary_from_percent(0.0f);
+      linear_from_percent(0.0f);
+      polish_stop();
+      emergency_force_active();           // safety default
+    } else {
+      rotary_from_percent(lastAuxCmd.rotary);
+      linear_from_percent(lastAuxCmd.lin);
+      polisher_from_percent(lastAuxCmd.polisher);
+      emergency_from_percent(lastAuxCmd.emergency);
+    }
+  }
+
+  // --- Debug mode print ---
   static unsigned long lastModePrint = 0;
   if (millis() - lastModePrint >= 250) {
     lastModePrint = millis();
@@ -626,5 +719,6 @@ void loop() {
     Serial.println(lastSerialCmd.wz, 3);
   }
 
+  // --- Drive output ---
   drive_from_cmdvel(cmd);
 }
