@@ -120,7 +120,7 @@ const unsigned long AUX_VALUES_TIMEOUT_MS = 300;
 #define EEPROM_ADDR_VALID 4    // 1 byte  (magic)
 #define EEPROM_MAGIC 0xA5
 
-const unsigned long EEPROM_SAVE_INTERVAL_MS = 5000; // save every 5 seconds
+const unsigned long EEPROM_SAVE_INTERVAL_MS = 5000;  // save every 5 seconds
 
 void loadEncoderFromEEPROM() {
   uint8_t magic;
@@ -774,7 +774,8 @@ bool read_commands_from_serial(CmdVel &tw, bool &gotTw,
 
 
 // Telemetry
-void sendDataToSerial() {
+// Build full line into buffer then send in one write — avoids repeated blocking on TX buffer
+void sendMachineData() {
   noInterrupts();
   long encSnap = encoderCount;
   interrupts();
@@ -784,31 +785,31 @@ void sendDataToSerial() {
   bool limR = digitalRead(limit_right);
   bool limL = digitalRead(limit_left);
 
-  Serial.print("@machineData,");
-  Serial.print(millis());
-  Serial.print(",");
-  Serial.print(g_linak.raw_filt);
-  Serial.print(",");
-  Serial.print(g_linak.pos_mm, 1);
-  Serial.print(",");
-  Serial.print(batTop, 2);
-  Serial.print(",");
-  Serial.print(batBot, 2);
-  Serial.print(",");
-  Serial.print(limR ? 1 : 0);
-  Serial.print(",");
-  Serial.print(limL ? 1 : 0);
-  Serial.print(",");
-  Serial.print(g_angle, 1);
-  Serial.print(",");
-  Serial.print(g_rpm, 1);
-  Serial.print(",");
-  Serial.println(encSnap); // absolute encoder count
+  char buf[128];
+  int len = snprintf(buf, sizeof(buf),
+    "@machineData,%lu,%u,%.1f,%.2f,%.2f,%d,%d,%.1f,%.1f,%ld\n",
+    millis(), g_linak.raw_filt, g_linak.pos_mm,
+    batTop, batBot, limR ? 1 : 0, limL ? 1 : 0,
+    g_angle, g_rpm, encSnap);
+  if (len > 0 && len < (int)sizeof(buf))
+    Serial.write(buf, len);
+}
+
+void sendSbusData() {
+  char buf[128];
+  int len = snprintf(buf, sizeof(buf),
+    "@sbusData,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+    sbusChannels[0],  sbusChannels[1],  sbusChannels[2],  sbusChannels[3],
+    sbusChannels[4],  sbusChannels[5],  sbusChannels[6],  sbusChannels[7],
+    sbusChannels[8],  sbusChannels[9],  sbusChannels[10], sbusChannels[11],
+    sbusChannels[12], sbusChannels[13], sbusChannels[14], sbusChannels[15]);
+  if (len > 0 && len < (int)sizeof(buf))
+    Serial.write(buf, len);
 }
 
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(230400);
   delay(300);
 
   MB_SERIAL.begin(MB_BAUD, SERIAL_8E1);
@@ -880,7 +881,17 @@ void loop() {
   // Read SBUS
   if (sbus_rx.Read()) {
     sbus_data = sbus_rx.data();
-    for (int i = 0; i < 16; i++) sbusChannels[i] = sbus_data.ch[i];
+    // for (int i = 0; i < 16; i++) {
+    //   Serial.print(sbus_data.ch[i]);
+    //   if (i == 15) {
+    //     Serial.println("");
+    //   } else {
+    //     Serial.print(",");
+    //   }
+    // }
+    for (int i = 0; i < 16; i++) {
+      sbusChannels[i] = sbus_data.ch[i];
+    }
     readAllChannels(percent);
   }
 
@@ -888,11 +899,18 @@ void loop() {
   updateEncoderData();
   updateLinakFast();
 
-  // Telemetry at 50 Hz
-  static unsigned long lastTel = 0;
-  if (millis() - lastTel >= 20) {
-    lastTel = millis();
-    sendDataToSerial();
+  // machineData at 50 Hz
+  static unsigned long lastMachTel = 0;
+  if (millis() - lastMachTel >= 20) {
+    lastMachTel = millis();
+    sendMachineData();
+  }
+
+  // sbusData at 25 Hz, offset 10 ms from machineData to avoid TX collision
+  static unsigned long lastSbusTel = 0;
+  if (millis() - lastSbusTel >= 40) {
+    lastSbusTel = millis() - 10;
+    sendSbusData();
   }
 
   // Save encoder to EEPROM every 5 seconds
