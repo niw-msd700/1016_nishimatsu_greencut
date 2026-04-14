@@ -115,6 +115,10 @@ unsigned long lastAuxCmdMs = 0;
 const unsigned long AUX_VALUES_TIMEOUT_MS = 300;
 
 
+// Encoder state — declared here so EEPROM functions below can reference it
+volatile long encoderCount = 0;
+volatile bool zPulse = false;
+
 // EEPROM encoder persistence
 #define EEPROM_ADDR_ENCODER 0  // 4 bytes (long)
 #define EEPROM_ADDR_VALID 4    // 1 byte  (magic)
@@ -272,8 +276,6 @@ float readBatteryBottom() {
 
 
 // Encoder
-volatile long encoderCount = 0;
-volatile bool zPulse = false;
 
 const int PPR = 1000;
 const int CPR = PPR * 4;
