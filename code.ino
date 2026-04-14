@@ -787,12 +787,19 @@ void sendMachineData() {
   bool limR = digitalRead(limit_right);
   bool limL = digitalRead(limit_left);
 
+  // AVR snprintf does not support %f — use dtostrf to convert floats first
+  char sPos[10], sBatT[10], sBatB[10], sAngle[10], sRpm[10];
+  dtostrf(g_linak.pos_mm, 1, 1, sPos);
+  dtostrf(batTop,         1, 2, sBatT);
+  dtostrf(batBot,         1, 2, sBatB);
+  dtostrf(g_angle,        1, 1, sAngle);
+  dtostrf(g_rpm,          1, 1, sRpm);
+
   char buf[128];
   int len = snprintf(buf, sizeof(buf),
-    "@machineData,%lu,%u,%.1f,%.2f,%.2f,%d,%d,%.1f,%.1f,%ld\n",
-    millis(), g_linak.raw_filt, g_linak.pos_mm,
-    batTop, batBot, limR ? 1 : 0, limL ? 1 : 0,
-    g_angle, g_rpm, encSnap);
+    "@machineData,%lu,%u,%s,%s,%s,%d,%d,%s,%s,%ld\n",
+    millis(), g_linak.raw_filt, sPos, sBatT, sBatB,
+    limR ? 1 : 0, limL ? 1 : 0, sAngle, sRpm, encSnap);
   if (len > 0 && len < (int)sizeof(buf))
     Serial.write(buf, len);
 }
